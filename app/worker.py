@@ -1,3 +1,6 @@
+import hashlib
+import hmac
+import json
 import random
 import time
 
@@ -11,7 +14,7 @@ MAX_DELAY = 3600      # one hour cap
 POLL_INTERVAL = 1     # seconds to sleep when nothing is due
 
 CLAIM_SQL = """
-    SELECT d.id, d.event_id, d.retry_count, e.type, e.payload, p.url
+    SELECT d.id, d.event_id, d.retry_count, e.type, e.payload, p.url, p.signing_secret
     FROM deliveries d
     JOIN events e ON e.id = d.event_id
     JOIN endpoints p ON p.id = d.endpoint_id
@@ -27,13 +30,25 @@ def backoff_seconds(retry_count: int) -> float:
     return random.uniform(0, ceiling)  # full jitter
 
 
+def sign(secret: str, timestamp: str, body: str) -> str:
+    message = f"{timestamp}.{body}".encode()
+    return hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()
+
+
 def process_one() -> bool:
     with get_connection() as conn:
         row = conn.execute(CLAIM_SQL).fetchone()
         if row is None:
             return False
 
-        delivery_id, event_id, retry_count, event_type, payload, url = row
+        delivery_id, event_id, retry_count, event_type, payload, url, secret = row
+
+        body = json.dumps(
+            {"id": str(event_id), "type": event_type, "data": payload},
+            separators=(",", ":"),
+        )
+        timestamp = str(int(time.time()))
+        signature = sign(secret, timestamp, body)
 
         status_code = None
         error = None
@@ -41,8 +56,13 @@ def process_one() -> bool:
         try:
             resp = httpx.post(
                 url,
-                json={"id": str(event_id), "type": event_type, "data": payload},
-                headers={"Webhook-Id": str(event_id)},
+                content=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Webhook-Id": str(event_id),
+                    "Webhook-Timestamp": timestamp,
+                    "Webhook-Signature": f"sha256={signature}",
+                },
                 timeout=5.0,
             )
             status_code = resp.status_code
